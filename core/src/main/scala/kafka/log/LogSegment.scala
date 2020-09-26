@@ -141,10 +141,11 @@ class LogSegment private[log] (val log: FileRecords,
    * @throws LogSegmentOffsetOverflowException if the largest offset causes index offset overflow
    */
   @nonthreadsafe
-  def append(largestOffset: Long,
-             largestTimestamp: Long,
-             shallowOffsetOfMaxTimestamp: Long,
-             records: MemoryRecords): Unit = {
+  def append(largestOffset: Long, // 最大位移
+             largestTimestamp: Long, // 最大时间戳
+             shallowOffsetOfMaxTimestamp: Long, // 最大时间戳对应的位移
+             records: MemoryRecords // 要写入的消息集合
+            ): Unit = {
     if (records.sizeInBytes > 0) {
       trace(s"Inserting ${records.sizeInBytes} bytes at end offset $largestOffset at position ${log.sizeInBytes} " +
             s"with largest timestamp $largestTimestamp at shallow offset $shallowOffsetOfMaxTimestamp")
@@ -154,12 +155,14 @@ class LogSegment private[log] (val log: FileRecords,
 
       ensureOffsetInRange(largestOffset)
 
+      // 执行真正的消息写入
       // append the messages
       val appendedBytes = log.append(records)
       trace(s"Appended $appendedBytes to ${log.file} at end offset $largestOffset")
       // Update the in memory max timestamp and corresponding offset.
       if (largestTimestamp > maxTimestampSoFar) {
         maxTimestampSoFar = largestTimestamp
+
         offsetOfMaxTimestampSoFar = shallowOffsetOfMaxTimestamp
       }
       // append an entry to the index (if needed)
@@ -288,13 +291,15 @@ class LogSegment private[log] (val log: FileRecords,
    *         or null if the startOffset is larger than the largest offset in this log
    */
   @threadsafe
-  def read(startOffset: Long,
-           maxSize: Int,
-           maxPosition: Long = size,
-           minOneMessage: Boolean = false): FetchDataInfo = {
+  def read(startOffset: Long, // 要读取的第一条消息的位移
+           maxSize: Int, // 能读取的最大字节数
+           maxPosition: Long = size, // 能读到的最大文件位置
+           minOneMessage: Boolean = false // 是否允许在消息体过大时至少返回第一条消息
+          ): FetchDataInfo = {
     if (maxSize < 0)
       throw new IllegalArgumentException(s"Invalid max size $maxSize for log read from segment $log")
 
+    // 读取索引，获取position
     val startOffsetAndSize = translateOffset(startOffset)
 
     // if the start position is already off the end of the log, return null

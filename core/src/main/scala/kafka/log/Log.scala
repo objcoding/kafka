@@ -49,6 +49,8 @@ import scala.jdk.CollectionConverters._
 import scala.collection.mutable.{ArrayBuffer, ListBuffer}
 import scala.collection.{Seq, Set, mutable}
 
+
+// 保存了一组待写入消息的各种元数据信息。比如，这组消息中第一条消息的位移值是多少、最后一条消息的位移值是多少；再比如，这组消息中最大的消息时间戳又是多少。
 object LogAppendInfo {
   val UnknownLogAppendInfo = LogAppendInfo(None, -1, RecordBatch.NO_TIMESTAMP, -1L, RecordBatch.NO_TIMESTAMP, -1L,
     RecordConversionStats.EMPTY, NoCompressionCodec, NoCompressionCodec, -1, -1, offsetsMonotonic = false, -1L)
@@ -97,6 +99,7 @@ object LeaderHwChange {
  *                       Same if high watermark is not changed. None is the default value and it means append failed
  *
  */
+// 可以理解为其对应伴生类的工厂方法类，里面定义了一些工厂方法，用于创建特定的 LogAppendInfo 实例。
 case class LogAppendInfo(var firstOffset: Option[Long],
                          var lastOffset: Long,
                          var maxTimestamp: Long,
@@ -1091,19 +1094,23 @@ class Log(@volatile private var _dir: File,
                      leaderEpoch: Int,
                      ignoreRecordSize: Boolean): LogAppendInfo = {
     maybeHandleIOException(s"Error while appending records to $topicPartition in dir ${dir.getParent}") {
+      // 第1步：分析和验证待写入消息集合，并返回校验结果
       val appendInfo = analyzeAndValidateRecords(records, origin, ignoreRecordSize)
 
+      // 如果压根就不需要写入任何消息，直接返回即可
       // return if we have no valid messages or if this is a duplicate of the last appended entry
       if (appendInfo.shallowCount == 0)
         return appendInfo
 
+      // 第2步：消息格式规整，即删除无效格式消息或无效字节
       // trim any invalid bytes or partial messages before appending it to the on-disk log
       var validRecords = trimInvalidBytes(records, appendInfo)
 
       // they are valid, insert them in the log
       lock synchronized {
-        checkIfMemoryMappedBufferClosed()
-        if (assignOffsets) {
+        checkIfMemoryMappedBufferClosed() // 确保Log对象未关闭
+        if (assignOffsets) { // 需要分配位移
+          // 第3步：使用当前LEO值作为待写入消息集合中第一条消息的位移值
           // assign offsets to the message set
           val offset = new LongRef(nextOffsetMetadata.messageOffset)
           appendInfo.firstOffset = Some(offset.value)
@@ -1128,6 +1135,7 @@ class Log(@volatile private var _dir: File,
             case e: IOException =>
               throw new KafkaException(s"Error validating messages while appending to log $name", e)
           }
+          // 更新校验结果对象类LogAppendInfo
           validRecords = validateAndOffsetAssignResult.validatedRecords
           appendInfo.maxTimestamp = validateAndOffsetAssignResult.maxTimestamp
           appendInfo.offsetOfMaxTimestamp = validateAndOffsetAssignResult.shallowOffsetOfMaxTimestamp
@@ -1136,6 +1144,7 @@ class Log(@volatile private var _dir: File,
           if (config.messageTimestampType == TimestampType.LOG_APPEND_TIME)
             appendInfo.logAppendTime = now
 
+          // 第4步：验证消息，确保消息大小不超限
           // re-validate message sizes if there's a possibility that they have changed (due to re-compression or message
           // format conversion)
           if (!ignoreRecordSize && validateAndOffsetAssignResult.messageSizeMaybeChanged) {
@@ -1150,9 +1159,9 @@ class Log(@volatile private var _dir: File,
               }
             }
           }
-        } else {
+        } else { // 直接使用给定的位移值，无需自己分配位移值
           // we are taking the offsets we are given
-          if (!appendInfo.offsetsMonotonic)
+          if (!appendInfo.offsetsMonotonic) // 确保消息位移值的单调递增性
             throw new OffsetsOutOfOrderException(s"Out of order offsets found in append to $topicPartition: " +
                                                  records.records.asScala.map(_.offset))
 
@@ -1175,6 +1184,7 @@ class Log(@volatile private var _dir: File,
           }
         }
 
+        // 第5步：更新Leader Epoch缓存
         // update the epoch cache with the epoch stamped onto the message by the leader
         validRecords.batches.forEach { batch =>
           if (batch.magic >= RecordBatch.MAGIC_VALUE_V2) {
@@ -1190,12 +1200,14 @@ class Log(@volatile private var _dir: File,
           }
         }
 
+        // 第6步：确保消息大小不超限
         // check messages set size may be exceed config.segmentSize
         if (validRecords.sizeInBytes > config.segmentSize) {
           throw new RecordBatchTooLargeException(s"Message batch size is ${validRecords.sizeInBytes} bytes in append " +
             s"to partition $topicPartition, which exceeds the maximum configured segment size of ${config.segmentSize}.")
         }
 
+        // 第7步：执行日志切分。当前日志段剩余容量可能无法容纳新消息集合，因此有必要创建一个新的日志段来保存待写入的所有消息
         // maybe roll the log if this segment is full
         val segment = maybeRoll(validRecords.sizeInBytes, appendInfo)
 
@@ -1204,6 +1216,7 @@ class Log(@volatile private var _dir: File,
           segmentBaseOffset = segment.baseOffset,
           relativePositionInSegment = segment.size)
 
+        // 第8步：验证事务状态
         // now that we have valid records, offsets assigned, and timestamps updated, we need to
         // validate the idempotent/transactional state of the producers and collect some metadata
         val (updatedProducers, completedTxns, maybeDuplicate) = analyzeAndValidateProducerState(
@@ -1217,11 +1230,14 @@ class Log(@volatile private var _dir: File,
           return appendInfo
         }
 
+        // 第9步：执行真正的消息写入操作，主要调用日志段对象的append方法实现
         segment.append(largestOffset = appendInfo.lastOffset,
           largestTimestamp = appendInfo.maxTimestamp,
           shallowOffsetOfMaxTimestamp = appendInfo.offsetOfMaxTimestamp,
           records = validRecords)
 
+        // 第10步：更新LEO对象，其中，LEO值是消息集合中最后一条消息位移值+1
+        // 前面说过，LEO值永远指向下一条不存在的消息
         // Increment the log end offset. We do this immediately after the append because a
         // write to the transaction index below may fail and we want to ensure that the offsets
         // of future appends still grow monotonically. The resulting transaction index inconsistency
@@ -1230,6 +1246,7 @@ class Log(@volatile private var _dir: File,
         // if the append to the transaction index fails.
         updateLogEndOffset(appendInfo.lastOffset + 1)
 
+        // 第11步：更新事务状态
         // update the producer state
         for (producerAppendInfo <- updatedProducers.values) {
           producerStateManager.update(producerAppendInfo)
@@ -1255,9 +1272,12 @@ class Log(@volatile private var _dir: File,
           s"next offset: ${nextOffsetMetadata.messageOffset}, " +
           s"and messages: $validRecords")
 
+        // 是否需要手动落盘。一般情况下我们不需要设置Broker端参数log.flush.interval.messages
+        // 落盘操作交由操作系统来完成。但某些情况下，可以设置该参数来确保高可靠性
         if (unflushedMessages >= config.flushInterval)
           flush()
 
+        // 第12步：返回写入结果
         appendInfo
       }
     }
